@@ -1,0 +1,654 @@
+#! /bin/bash
+##
+##	© swizatmyprivacydotca, CC BY-SA 4.0 - http://creativecommons.org/licenses/by-sa/4.0/
+##
+##
+##	makemd5tar:
+##
+##    (Bash) tar generation and integrity verification
+##
+##    Collapse a group of files into a tar, then calculate md5's and prepend
+##    them and creation (log) files into the tar, from where they can later be
+##    extracted first, likely even if the tar is damaged.
+##
+##    As tar will not let you append files to a compressed (e.g. .xz) tar,
+##    hold off compression until the very end.
+##
+##    By leaving copies of the log and md5 lists outside the archive,  they
+##    can be searched any time, rather than having to traverse (list) the tar
+##    each and every time. Including ... what's in there (again)?
+##
+##    Given the availability of self-compressing and dedupping filesystems
+##    today, such as btrfs, don't bother compressing with xz at all. Nothing
+##    prevents the user from 'xz mydir.tar', however they wish, afterwards.
+##
+##    - further testing shows ... there can indeed be significant file size
+##      space savings with compression. Use at own risk - when compression
+##      goes bad, it goes very bad.
+##      - see 'ls -l <file>' vs 'du -h <file>' for size differences.
+##
+##    - For possible help, see:
+##      - http://www.gzip.org/recover.txt ,
+##      - https://github.com/BestSolution-at/fixtar ,
+##      - https://github.com/arenn/gzrt
+##
+##    Further details in comments at end.
+##
+#
+#	Don't forget to run shellcheck.
+
+# set -v -x
+
+# set | grep ^BASH | sort | less
+# echo \$# = \'$#\'
+# - somehow $# was getting changed (pre-shift, even).
+
+set -o nounset	# == set -u
+set -o errexit	# == set -e
+
+	trap 'echo -e \n${IAM}: Non-zero \($?\) exit trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n' ERR
+#	trap '[[ $? != 0 ]] && { echo -e \n${IAM}: Exit \($?\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n ; set | sort | less' EXIT
+	trap '[[ $? != 0 ]] && { echo -e \n${IAM}: Exit \($?\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n ; }' EXIT
+
+#	trap -l	# List trap (signal) names & numbers.
+#	trap -p	# List set traps with commands.
+
+#	Equivalence exit so we don't have to worry whether we're sourced or not.
+#	- this could be avoided by creating main(), then exit will always be
+#	  correct. Some day.
+#	i.e. Called shell console doesn't also get exited. Nor worry about what to
+#	      use for return # if in a func.
+
+function lexit() { exit ; }
+
+# Else, something like the following is needed:
+# # echo \$BASH_SOURCE\[0\] = \'${BASH_SOURCE[0]}\'
+# # echo \$\{0\} = \'${0}\'
+#   declare -g lexit='exit'
+# # if we're sourced, exit with return instead of with exit.
+#   [[ "${BASH_SOURCE[0]}" != "${0}" ]] && lexit='return'
+#   readonly lexit
+
+# echo \$lexit = \'$lexit\'
+
+
+#	Uncomment to override user's xz defaults.
+#	export XZ_OPT='-9e'
+
+	declare -gr	CRLF=$'\n'
+	declare -gr	TAB=$'\t'
+	declare -g	IAM	;	IAM=$(basename "${0}")	;	readonly IAM
+
+	declare -gir largc=$#
+
+	declare -gi GOTERR=0
+	declare -gi CurrErr=0
+
+	declare -gi itmp
+
+	declare -g tmpstr
+	declare -g tmpfile=""
+	
+	declare -ga mycmdline
+
+	declare -ga   myfilelist_vars
+	declare -ga   myfilelist
+	declare -ga o_myfilelist
+
+	declare -gi bwecompressed=0
+
+#	declare -g myprompt
+
+#
+# tar defaults: --no-ignore-case --overwrite-dir (metadata) --recursion
+#
+# Hmmm. Want -overwrite-dir on restore creation, probably --no-overwrite-dir on restore addition / insertion.
+#
+# Operations: -A = --concatenate | --catenate (tars), -c = --create, -d = verify (--diff | --compare), --delete (file from archive), -r = --append (files to end of archive), -t = --list (files in archive), --test-label, -u = --update (files in archive), -x = --extract (| --get)
+#
+# Compression methods: -a = --auto-compress (take from tar file name), -j = --bzip2, -J = --xz, --lzip, --lzma, --lzop, -z = --gzip, -Z = --compress
+#
+# Other interesting options: --overwrite, -C = --directory (change to dir before operating), -T = --files-from (filename of list of filenames to use), -O = --to-stdout (instead of the terminal)
+#
+# Options: -a = --auto-compress, -l = --check-links, -p = --preserve-permissions, -s = --preserve-order, --preserve = -p -s, -v = --verbose, -w = --interactive, -W = --verify
+
+	declare -ga mytaroptions_all=( --auto-compress --atime-preserve=system --check-links --one-file-system --preserve-permissions )
+#	--sameorder not doing the expected (keep filelist in sorted order). Instead, it prevents tar from getting the filelist and sorting it before proceeding
+#	  - it's a low memory option. So no point to using --sameorder. See sort-name.
+
+	declare -g tarverstr; tarverstr=$(tar --version | head -n 1) ; readonly tarverstr
+
+		[[ ! "${tarverstr}" < "tar (GNU tar) 1.27" ]] && mytaroptions_all+=( --selinux --xattrs --acls )
+		[[ ! "${tarverstr}" < "tar (GNU tar) 1.28" ]] && mytaroptions_all+=( --sort=name )
+
+	readonly mytaroptions_all
+#	echo \$mytaroptions_all = \'${mytaroptions_all}\'
+
+
+#	DON'T USE --remove-files here - DANGEROUS. Better to surgically put within individual command calls.
+
+	declare -gar mytaroptions_create=(   --checkpoint=100 --checkpoint-action=dot --totals --verbose --create	)
+	declare -gar mytaroptions_catenate=( --checkpoint=100 --checkpoint-action=dot --totals --verbose --catenate	)
+	declare -gar mytaroptions_append=(   --checkpoint=100 --checkpoint-action=dot --totals --verbose --append	)
+
+#	declare -gr mytaroptions_md5create=" --to-stdout "
+#	declare -gr mytaroptions_noncreate="  "
+
+
+	declare -ga	mycmdline_create		# Note: --file changes, post-mydir.tar processing.
+	declare -ga	mycmdline_append
+	declare -ga	mycmdline_tarrestore	# Note: --file changes, post-mydir.tar processing.
+	declare -ga	mycmdline_tarverify
+	declare -ga	mycmdline_dashmd5verify
+
+	declare -ga	mycmdline_filemd5verify
+
+	declare -ga	mycmdline_diffmd5verify
+	declare -ga	diffmd5verify_success
+	declare -ga mycmdline_striplog
+
+#	set +o nounset errexit	# BUGGER! Line caused $# to go to 1!
+#	- was trying to work around undefined var ERR trap with bstarbasename="$1"
+
+	declare -gr bstarbasename=${1:-""}
+
+	shift || true									# shift gives error if $# = 0, kicking in set -e. || true lets it pass set -e.
+	declare -ga myfileargs=${*:-"${bstarbasename}"}	; readonly myfileargs
+
+#	echo \'${bstarbasename}\' \'${myfileargs}\'
+
+	declare -gr mytarname="${bstarbasename}.tar"
+	declare -gr bstarname="${bstarbasename}.md5.tar"
+
+	declare -gr	xcomp="xz"
+	declare -gr	xlog="log"
+#	declare -gr xfilelist="filelist"	# Not generating filelist any more - equivalent(s) exist elsewithin.
+	declare -gr xlsl="lslist"
+	declare -gr xmd5ls="md5list"		# md5s, real filenames.
+	declare -gr	xmd5s="md5s"			# md5s, - filenames
+	declare -gr xhowto="howto.txt"
+
+	declare -gr xxorig="orig"
+	declare -gr xxnow="now"
+	
+	declare -gr    bstarname_xz="${bstarname}.${xcomp}"
+	declare -gr    bstarlogname="${bstarname}.${xlog}"
+#	declare -gr   bstarfilelist="${bstarname}.${xfilelist}"
+	declare -gr     bstarlslist="${bstarname}.${xlsl}"
+	declare -gr    bstarmd5list="${bstarname}.${xmd5ls}"
+	declare -gr       bstarmd5s="${bstarname}.${xmd5s}"
+	declare -gr      bstarhowto="${bstarname}.${xhowto}"
+
+	# "SC2034: myvar appears unused. Verify it or export it."
+	# shellcheck disable=SC2034
+	declare -gr  o_bstarlogname="${bstarname}.${xxorig}.${xlog}"		# Not directly used any more ≡ indirect via o_${!bstarlogname}, thus shellcheck disable=SC2034
+#	declare -gr o_bstarfilelist="${bstarname}.${xxorig}.${xfilelist}"
+	# shellcheck disable=SC2034
+	declare -gr   o_bstarlslist="${bstarname}.${xxorig}.${xlsl}"		# Not directly used any more ≡ indirect via o_${!bstarlogname}
+	declare -gr  o_bstarmd5list="${bstarname}.${xxorig}.${xmd5ls}"
+	declare -gr     o_bstarmd5s="${bstarname}.${xxorig}.${xmd5s}"
+	declare -gr    o_bstarhowto="${bstarname}.${xxorig}.${xhowto}"
+
+	declare -gr     n_bstarmd5s="${bstarname}.${xmd5s}.${xxnow}"
+
+
+	function pauseiferror()
+{
+	{ (( CurrErr != 0 )) && GOTERR+=1 && read -rN1 -p "${CRLF}${IAM}: Non-zero (${CurrErr}) exit value encountered. Press Ctrl-C now to exit, or Enter to continue ..."  ; } || true
+}
+
+
+	if [[ -z "${bstarbasename}" ]] ; then
+	{
+		cat <<-EOF
+
+			Usage: makemd5tar <tar name> [<files to include ...>]
+			(as in, make 'md5 tar' - [Bash] tar integrity verification)
+			- if <files to include...> is not included, the <tar name> directory is assumed.
+
+			e.g. 'makemd5tar mydir'
+			- create a 'mydir.tar tarball out of the 'mydir' directory.
+
+			This script packs files into a tar file, notes the ls and non-ls filenames,
+			generates the md5sum for each file into an md5 files, prepends these files to
+			the tarball, then tests the integrity of the whole. Commands are listed.
+
+		EOF
+
+		lexit
+	} fi
+
+	if (( largc < 2 )) ; then
+	{
+		read -rN1 -p "${CRLF}${IAM}: Using '${myfileargs[@]}' as both the tar filename and the directory to include.${CRLF}${CRLF}${TAB}If this is not what you want, press Ctrl-C to exit now.${CRLF}${CRLF}${TAB}Otherwise, press Enter to continue ...${CRLF}${CRLF}${TAB}"
+
+		echo -e "Running: '${0}' '${bstarbasename}' '${myfileargs[@]}'\n"
+	} fi
+
+
+#	Sadly:
+#	(1) tar output goes to --index-file OR stdout, NOT BOTH - (*&^(*&^(*^&(*^
+#	(2) tar's stderr (error/inform messages) GETS INTERMIXED INTO STDOUT! Can't keep things clean. e.g. 2> $tty | tee -a filelist.file
+#	    e.g. set -x ; tar ${mytaroptions_all} ${mytaroptions_create} --index-file "${bstarfilelist}" --file "${mytarname}" "${myfileargs}" 2>&1 | tee "${bstarlslist}" ; set +x
+
+
+	mycmdline_create=(	tar "${mytaroptions_all[@]}" 	"${mytaroptions_create[@]}"	--remove-files	--file "${mytarname}" "${myfileargs[@]}"	)
+
+
+#	Intent of $mycmdline was to be able to echo cmdlines to screen.
+#	And/or to a ${0}.log file, if such is ever implemented.
+#	 (set -/+x being ugly, non-transparent, and user confusing.)
+#	e.g. # "echo Running: '${mycmdline[@]}' >> ${mylogfile}"
+#	- such have proven to be of tremendous value to the user, after the fact,
+#	  when something(s) go south. And they will. Eventually.
+#     e.g. Ability to rerun the indicated command when error cause addressed.
+#
+#	e.g.	echo -e "\n${IAM}: Running tar ...\n('${mycmdline[@]}')"
+#
+#	Thanks to shellcheck, $mycmdline construct works, now that vars are arrays, not strings.
+
+
+#	additional --verbose added here to get ls -l version of log.
+
+	mycmdline=( "${mycmdline_create[@]}" --verbose	)
+
+	echo -e "\n${IAM}: Running tar ...\n"
+
+	set -x ; "${mycmdline[@]}" 2>&1 | tee "${bstarlogname}"  ; set +x
+
+	CurrErr=$? ; pauseiferror
+
+
+
+	mycmdline_striplog=( sed 's/^\.*//' "${bstarlogname}" )
+
+	mycmdline=( "${mycmdline_striplog[@]}" )
+	
+	echo -e "\n${IAM}: Generating tar ls filelist from logfile ...\n"
+	
+	set -x ; "${mycmdline[@]}"  | tee "${bstarlslist}" ; set +x
+#	less "${bstarfilelist}"
+
+	CurrErr=$? ; pauseiferror
+
+
+#	In the end, want:	  { md5sum - ; echo \$TAR_REALNAME ; } | sed -e ':a;N;$!ba;s/-\n//g'
+#	For:	--to-command='{ md5sum - ; echo \$TAR_REALNAME ; } | sed -e ':a;N;$!ba;s/-\n//g''
+
+	tmpstr="{ md5sum - ; echo \$TAR_REALNAME ; } | sed -e ':a;N;\$!ba;s/-\\n//g'"
+
+	# notshellcheck disable=SC2072 "SC2072: Decimals are not supported. Either use integers only, or use bc or awk to compare."
+
+#	if [[ ! "${BASH_VERSION}" < "4.3" ]] ; then
+	if [[ ! "${tarverstr}" < "tar (GNU tar) 1.27" ]] ; then
+	{
+		# (K)ubuntu 12.04, $BASH_VERSION 4.2.25(1)-release, this code wasn't
+		# needed, things worked just fine. Move to (K)ubuntu 14.04,
+		# $BASH_VERSION 4.3.11(1)-release and it falls over. tar reports
+		# (within to-command subshell):
+		# tar: { md5sum - ; echo $TAR_REALNAME ; } | sed -e '\:a;N;$!ba;s/-\\n//g': Cannot exec: No such file or directory \
+		# tar: Error is not recoverable: exiting now
+		#
+		# Note, the : is being escaped now. i.e. \:
+		#
+		# However ... put the bit in a separate script file, it's all happy. <sigh>
+
+		# NO!!! PROBLEM IS NOT BASH, PROBLEM IS ***TAR*** CHANGED!!!
+
+		tmpfile=$(mktemp --tmpdir "${IAM}"-XXX)
+		echo "${tmpstr}" > "${tmpfile}"
+		tmpstr="bash ${tmpfile}"
+	} fi
+
+	# Work around quoting issues, keep shellcheck happy.
+	# *** "To escape the single quote, close the quoting before it, insert the single quote, and re-open the quoting." ***
+	#	tmpstr=\''{ md5sum - ; echo \$TAR_REALNAME ; } | sed -e '\'':a;N;$!ba;s/-\\n//g'\'\'
+
+	mycmdline_tarrestore=( tar "${mytaroptions_all[@]}" 				--extract 		--file "${mytarname}")
+	
+	mycmdline=(	"${mycmdline_tarrestore[@]}" --to-command="${tmpstr}" )
+	
+	echo -e "\n${IAM}: Generating md5sum list file ...\n"
+
+	set -x ; "${mycmdline[@]}" | tee "${bstarmd5list}" ; set +x
+
+	CurrErr=$? ; pauseiferror
+
+	if [[ ! -z $tmpfile ]] ; then
+	{
+		rm "${tmpfile}" || true
+		tmpfile=""
+	} fi
+
+
+#	in testing, did 'find mydir -type f -exec md5sum {} \; > mydir.bstar.md5list2'
+#	both diff and cmp reported the .md5list and .md5list2 (above) were EXACTLY the
+#	same. i.e. to the byte level. Cool!
+
+
+	# Files to be included at top of tar ...
+	
+	myfilelist_vars=( bstarlogname bstarlslist bstarmd5list )
+
+	myfilelist=( "${!myfilelist_vars[0]}" "${!myfilelist_vars[1]}" "${!myfilelist_vars[2]}" )
+
+	# The above is equivalent to:
+	# myfilelist=( "${bstarlogname}" "${bstarlslist}" "${bstarmd5list}" )
+	# - however, the indirection means only 1 place to maintain/change the filelist.
+	
+#	echo "${myfilelist_vars[0]}" is \'"${!myfilelist_vars[0]}"\'
+#	echo "${myfilelist_vars[1]}" is \'"${!myfilelist_vars[1]}"\'
+#	echo "${myfilelist_vars[2]}" is \'"${!myfilelist_vars[2]}"\'
+#	echo \!myfilelist_vars[@] is \'"${!myfilelist_vars[@]}"\'
+#	echo myfilelist_vars is \'"${myfilelist_vars[@]}"\'
+#	echo myfilelist is \'"${myfilelist[@]}"\'
+
+
+	read -rN1 -t 10 -p "${CRLF}${IAM}: Press 'y' to review file lists and logs, anything else to continue ...${CRLF}${TAB}[Times out in 10 seconds to skip.]${CRLF}" || true
+
+	[[ ${REPLY:0:1} == "y" ]] && less "${myfilelist[@]}"
+
+	
+#	Originally, compressed log files (and re-extracted .log file here [due to
+#	--remove-files]), to gain checksumming for those files. However, once
+#	discovered that tar won't append to compressed tarballs, (thus the tarball
+#	is now not compressed [yet],) there is no point - the final compressing
+#	will suffice.
+
+
+#	myfilelist=( "${bstarhowto}" "${myfilelist[@]}" )
+
+	myfilelist_vars=( bstarhowto "${myfilelist_vars[@]}" )
+	
+#	echo myfilelist_vars = "${myfilelist_vars[@]}"
+
+	myfilelist=( "${!myfilelist_vars[0]}" "${myfilelist[@]}" )
+
+#	echo \$myfilelist is \'${myfilelist[@]}\'
+
+	mycmdline_create=(			tar "${mytaroptions_all[@]}" 	"${mytaroptions_create[@]}"		--file "${bstarname}" "${myfilelist[@]}"		)	# Changed from earlier.
+	mycmdline_catenate=(		tar "${mytaroptions_all[@]}"	"${mytaroptions_catenate[@]}"	--file "${bstarname}" "${mytarname}"			)
+	mycmdline_append=(			tar "${mytaroptions_all[@]}" 	"${mytaroptions_append[@]}"		--file "${bstarname}" "${bstarmd5s}"			)
+	mycmdline_tarlist=(			tar "${mytaroptions_all[@]}"	--list		--verbose															)	# Changed from earlier.
+	mycmdline_tarrestore=(		tar "${mytaroptions_all[@]}"	--extract						--file "${bstarname}"							)	# Changed from earlier.
+	mycmdline_tarverify=(		tar "${mytaroptions_all[@]}"	--compare	--verbose			--file "${bstarname}"							)
+	mycmdline_dashmd5verify=(	"${mycmdline_tarrestore[@]}" 	"--to-command=md5sum -"	)
+
+	mycmdline_filemd5verify=(	md5sum -c "${o_bstarmd5list}"	)
+
+	mycmdline_diffmd5verify=(	diff -s "${o_bstarmd5s}" "${n_bstarmd5s}"	)
+	diffmd5verify_success=( Files "${o_bstarmd5s}" and "${n_bstarmd5s}" are identical )
+
+
+	cat > "${bstarhowto}" <<-EOF
+	
+		Tar was seeded by: '${mycmdline_create[@]}'
+
+		(Then appended to by --catenate "${mytarname}" then with "${o_bstarmd5s}")
+
+		Note: Replace "${bstarname}" below with "${bstarname_xz}" as appropriate if tar is compressed.
+
+		Files can be restored from tar by: '${mycmdline_tarrestore[@]} --verbose'
+
+		After restoration, deposited files can be verified against tar by: '${mycmdline_tarverify[@]} --verbose'
+
+		After restoration, deposited files can be verified against original md5sums by: '${mycmdline_filemd5verify[@]}'
+
+		Any time, files within tar can be verified as undamaged by calculating md5sums again with: '${mycmdline_tarrestore[@]} "--to-command=md5sum -" | tee "${n_bstarmd5s}"'
+
+		... then running: '${mycmdline_diffmd5verify[@]}'
+
+		You should see: '
+		${diffmd5verify_success[@]}
+		'
+
+	EOF
+
+
+#
+#	So, to this point we have:
+#
+#	${bstarbasename} x
+#	${mytarname}     x.tar
+#	${bstarname}     x.md5.tar
+#
+#	${bstarlogname}  x.md5.tar.log
+# # ${bstarfilelist} x.md5.tar.filelist - no longer generating this. sed'ed log to ls list, instead.
+#	${bstarlslist}   x.md5.tar.howto.txt
+#	${bstarlslist}   x.md5.tar.lslist
+#	${bstarmd5list}  x.md5.tar.md5list
+#
+#	- make a tar of them, appending the tar above to it.
+#	- let's us put them at the beginning of the stream, so if something
+#	  botches it over time, mid-stream, they should be extractable for sanity
+#	  checking, and detecting -which- files got corrupted.
+#	  [If these early files aren't present, entire tar file probably isn't
+#	   present - and we wouldn't be here (running).]
+#
+
+	mycmdline=( "${mycmdline_create[@]}" )
+
+
+	echo -e "\n\n${IAM}: Initializing final tar file ...\n"
+
+	set -x ; "${mycmdline[@]}"  ; set +x
+
+	CurrErr=$? ; pauseiferror
+
+
+	mycmdline=( "${mycmdline_catenate[@]}"	)
+
+	echo -e "\n${IAM}: Appending source tarball ...\n"
+
+	set -x ; "${mycmdline[@]}"  ; set +x
+
+	CurrErr=$? ; pauseiferror
+
+
+	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
+
+ 	echo -e "\n${IAM}: Generating md5 list ...\n"
+ 
+	set -x ; "${mycmdline[@]}" | tee "${bstarmd5s}" ; set +x
+
+ 	CurrErr=$? ; pauseiferror
+
+
+#	- Append note to md5s (-) list to advise of expected diff results.
+#	- Append result to tar.
+#	- Regen'ed md5s (-) list should show no difference (being md5 diffs, not
+#	file content diffs). While providing an explanatory note, should the .orig
+#	files be lost. And providing, via early log files and this last appended
+#	file, a way for the user to validate both ends of the tar - from which one
+#	can likely conclude that everything else in the middle of the tar has also
+#	maintained its integrity.
+ 	
+	cat >> "${bstarmd5s}" <<-EOF
+
+		Note: If the original *.orig.md5s file (having '-' filenames, not original    filenames as the *.md5list file has) disappears, and this *.md5s file can still be successfully extracted from the still integral md5.tar file, diff will show  these last five text lines as added, and one last md5 line as different,        (ONLY!) - that's OK.
+
+		${TAB}This md5s file, with these text lines added to it, was appended to the  tar after the md5s were generated - and so will always show as being different, as will its md5sum. Being but a log file, that's OK - all your original data is safe *IF* diff reports that only these last lines differ.                       Enjoy, swizatmyprivacydotca, Oct. 2016.
+
+		EOF
+
+	tmpstr=$(md5sum "${bstarmd5s}" | sed 's/  .*$/  -/')
+
+	echo "${tmpstr}" >> "${bstarmd5s}"
+
+
+	mycmdline=( "${mycmdline_append[@]}"	)
+
+ 	echo -e "\n${IAM}: Appending md5s list to tar ...\n"
+
+	set -x ; "${mycmdline[@]}" ; set +x
+
+ 	CurrErr=$? ; pauseiferror
+
+
+	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
+
+ 	echo -e "\n${IAM}: Regenerating md5 list for future validation testing ...\n"
+
+	set -x ; "${mycmdline[@]}" | tee "${bstarmd5s}" ; set +x
+
+ 	CurrErr=$? ; pauseiferror
+
+
+#	myfilelist=( "${myfilelist[@]}" "${bstarmd5s}" )
+
+	myfilelist_vars+=( bstarmd5s )
+	myfilelist+=( "${!myfilelist_vars[-1]}" )
+
+#	echo \$myfilelist is \'"${myfilelist[@]}"\'
+
+#
+#	So, to this point we have added: ${bstarlogname}  x.md5.tar.md5s
+#
+#
+#	From prior:
+#	myfilelist=( "${bstarlogname}" "${bstarlslist}" "${bstarmd5list}" )
+#	myfilelist=( "${bstarhowto}" "${myfilelist[@]}" )
+#	myfilelist=( "${myfilelist[@]}" "${bstarmd5s}" )
+#
+#	and the *.md5.tar file itself, of course. And the <dir>.tar file, to be deleted later.
+#
+
+#	echo -e \\t"${o_${!myfilelist[0]}}"
+#	tmpstr="o_${myfilelist_vars[0]}"
+#	echo -e \\t tmpstr = "${tmpstr}"
+#	echo -e \\t \!tmpstr = "${!tmpstr}"
+
+#	o_myfilelist=( "${o_bstarhowto}" "${o_bstarlogname}" "${o_bstarlslist}" "${o_bstarmd5list}" "${o_bstarmd5s}" )
+#	echo "${myfilelist_vars[2]}" is \'"${!myfilelist_vars[2]}"\'
+
+	unset o_myfilelist
+	for(( itmp=0 ; itmp < "${#myfilelist[@]}" ; itmp++ )) ; do
+	{
+#		echo "${itmp}": "${myfilelist_vars[${itmp}]}"
+		tmpstr="o_${myfilelist_vars[${itmp}]}"
+		o_myfilelist+=( "${!tmpstr}" )
+	}; done
+
+#	echo o_myfilelist = "${o_myfilelist[@]}"
+
+
+	
+	echo -e "\n${IAM}: md5 list for future validation testing generated.\n\t... Renaming files with .orig. (And removing 'other' permissions.)\n\t[So restoring tarball won't (accidentally) overwrite them.]\n"
+
+	for(( itmp=0 ; itmp < "${#myfilelist[@]}" ; itmp++ )) ; do
+	{
+		mv -fvi "${myfilelist[$itmp]}" "${o_myfilelist[$itmp]}"	|| true	# -i shouldn't be needed, but in case something happens.
+		chmod -c a-x,o-rw "${o_myfilelist[$itmp]}"				|| true # Could use -v instead of -c.
+	}; done
+
+
+#	Originally, set files read only, however doing so causes later rsync (samba) aggravation. (When updates to read only files fail.)
+#
+#	chmod -v a-wx "${bstarmd5list}" "${bstarname_xz}" "${bstarmd5s}"
+#	chmod u+w "${bstarmd5list}" "${bstarname_xz}" "${bstarmd5s}"
+
+
+
+	echo -e "\n\n${IAM}: *** DO NOT LOSE THESE FILES ***:\n\n\t${o_myfilelist[@]}\n\n\t- if you do lose them, you can re-extract non-.orig named copies of them from the beginning of your tar. You will want to rename them once you do.\n"
+
+	echo -e "\n${IAM}: Contents of ${o_bstarhowto} -\n"
+
+	cat "${o_bstarhowto}"
+
+
+	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
+
+	echo -e "\n${IAM}: Running md5 validation test now ...\n"
+
+	set -x ; "${mycmdline[@]}" | tee "${n_bstarmd5s}" ; set +x
+
+	CurrErr=$? ; pauseiferror
+
+	echo
+	{ diff -s "${o_bstarmd5s}" "${n_bstarmd5s}" ; CurrErr=$? ; } || true
+
+
+	read -rN1 -t 20 -p "${CRLF}${CRLF}${IAM}: Press 'n' to not compress tar file - anything else to do so ...${CRLF}${TAB}[Times out in 20 seconds to compress.]${CRLF}" || true
+
+	if [[ ${REPLY:0:1} != "n" ]] ; then
+	{
+	 	echo -e "\n\n${IAM}: Compressing tarball to \"${bstarname_xz}\"...\n"
+
+	 	set -x ; xz -vz "${bstarname}" ; set +x
+
+	 	CurrErr=$? ; pauseiferror
+
+		bwecompressed=1
+
+		echo -e "\n\n${IAM}: Testing compressed files's integrity ...\n"
+
+		set -x ; xz -vt "${bstarname_xz}" ; set +x
+
+		CurrErr=$? ; pauseiferror
+
+
+		echo -e "\n\n${IAM}: Testing compressed tarballs's integrity ...\n"
+
+		mycmdline=( "${mycmdline_tarlist[@]}" --file "${bstarname_xz}"	)
+
+		set -x ; "${mycmdline[@]}" ; set +x
+
+		CurrErr=$? ; pauseiferror
+	} fi
+
+
+#	As --remove-files doesn't on catenate above ...
+
+	read -rN1 -t 20 -p "${CRLF}${CRLF}${IAM}: Press 'd' to remove intermediate tar file - anything else not to ...${CRLF}${TAB}[Times out in 20 seconds to keep.]${CRLF}" || true
+
+	[[ ${REPLY:0:1} == "d" ]] && { echo -e "\n" ; rm -v "${mytarname}" ; }
+
+	echo
+
+
+	echo -e "\nCommands have been saved to \"${o_bstarhowto}\" for your future       reference.\n"
+
+
+	tmpstr="${bstarname}"
+	[[ $bwecompressed == 1 ]] && tmpstr="${bstarname_xz}"
+
+	[[ $CurrErr == 0 ]] && echo -e "\n${IAM}: \"${tmpstr}\" creation concluded, ${GOTERR} errors.\n"
+
+
+set +v +x
+lexit
+
+
+#	Assume dir being tarred is named '8bit'
+#	
+#	STEPS:						Creates:
+#	------						--------
+#	 1. tar the tar				-> 8bit.md5.tar.log, 8bit.tar
+#	 2. ls -l					-> 8bit.md5.tar.lslist
+#	 3. md5sum					-> 8bit.md5.tar.md5list (filenames)
+#	 4. Review files?
+#	 5. Create howto			-> 8bit.md5.tar.howto.txt
+#	 4. tar log files 			(above files - .log, .lslist, .md5list, .howto), 8bit.md5.tar
+#	 X. Re-extract log & md5list - don't --remove-files, so don't need to re-extract
+#	 X rm .filelist				 - no longer created in the first place.
+#	 6. Append orig. tar
+#	 7. Generate - md5 list		-> 8bit.md5.tar.md5s (- names)
+#	
+#	 8. Note >> md5s list
+#	 9. make md5s list md5 (one) line
+#	10. Append md5 line to md5s list.
+#	11. Append md5s list >> tar
+#	12. regen or extract md5s list
+#	    - therefore md5s will all match, only explain lines will be noted ON FILE DIFF
+#	    - md5s- will match, ON MD5s- DIFF
+#	13. Rename log files with .orig (note to keep)
+#	    [So can extract non-orig and diff between them and .orig should be equal.]
+#	    [Note .orig are named non-.orig (within tar), so if lost / rextracted, rename extracts to .orig. (No file schmuking, i.e. if .orig still present. Diffs remain equal.]
+#	    [EXCEPT md5s- (diff) which had lines appended, and before md5sum of itself appended (to ondisk yo be .orig version), thus diff will report lines added to tar version, and 1 different md5 line (of itself).]
+#	14. Do not lose these files.
+#	15. Run md5 validation test - which inherently tests the tar itself.
+#	16. Compress tar			-> 8bit.md5.tar.xz <- 8bit.md5.tar
+#	17. Test compressed tar ( tar -t).
+#	18. Test compressed tar ( tar -t).
+#	19. Delete original .tar?
+#	20. Report all well (?) & exit.
