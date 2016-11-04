@@ -45,10 +45,11 @@
 
 set -o nounset	# == set -u
 set -o errexit	# == set -e
+set -o pipefail	# So | tee doesn't obscure retcodes.
 
-	trap 'echo -e \n${IAM}: Non-zero \($?\) exit trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n' ERR
+	trap 'echo -e \\n${IAM}: Non-zero "${?}" exit code trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \\n' ERR
 #	trap '[[ $? != 0 ]] && { echo -e \n${IAM}: Exit \($?\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n ; set | sort | less' EXIT
-	trap '[[ $? != 0 ]] && { echo -e \n${IAM}: Exit \($?\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n ; }' EXIT
+	trap '[[ $? != 0 ]] && { echo -e \\n${IAM}: Exit \("${?}"\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \\n ; }' EXIT
 
 #	trap -l	# List trap (signal) names & numbers.
 #	trap -p	# List set traps with commands.
@@ -88,7 +89,7 @@ function lexit() { exit ; }
 
 	declare -g tmpstr
 	declare -g tmpfile=""
-	
+
 	declare -ga mycmdline
 
 	declare -ga   myfilelist_vars
@@ -96,6 +97,7 @@ function lexit() { exit ; }
 	declare -ga o_myfilelist
 
 	declare -gi bwecompressed=0
+	declare -gi bwermedorigtar=0
 
 #	declare -g myprompt
 
@@ -170,7 +172,7 @@ function lexit() { exit ; }
 
 	declare -gr xxorig="orig"
 	declare -gr xxnow="now"
-	
+
 	declare -gr    bstarname_xz="${bstarname}.${xcomp}"
 	declare -gr    bstarlogname="${bstarname}.${xlog}"
 #	declare -gr   bstarfilelist="${bstarname}.${xfilelist}"
@@ -232,7 +234,7 @@ function lexit() { exit ; }
 #	    e.g. set -x ; tar ${mytaroptions_all} ${mytaroptions_create} --index-file "${bstarfilelist}" --file "${mytarname}" "${myfileargs}" 2>&1 | tee "${bstarlslist}" ; set +x
 
 
-	mycmdline_create=(	tar "${mytaroptions_all[@]}" 	"${mytaroptions_create[@]}"	--remove-files	--file "${mytarname}" "${myfileargs[@]}"	)
+	mycmdline_create=(	tar "${mytaroptions_all[@]}" 	"${mytaroptions_create[@]}"	--remove-files	--verbose --file "${mytarname}" ${myfileargs[*]}	)
 
 
 #	Intent of $mycmdline was to be able to echo cmdlines to screen.
@@ -250,7 +252,7 @@ function lexit() { exit ; }
 
 #	additional --verbose added here to get ls -l version of log.
 
-	mycmdline=( "${mycmdline_create[@]}" --verbose	)
+	mycmdline=( "${mycmdline_create[@]}"	)
 
 	echo -e "\n${IAM}: Running tar ...\n"
 
@@ -263,9 +265,9 @@ function lexit() { exit ; }
 	mycmdline_striplog=( sed 's/^\.*//' "${bstarlogname}" )
 
 	mycmdline=( "${mycmdline_striplog[@]}" )
-	
+
 	echo -e "\n${IAM}: Generating tar ls filelist from logfile ...\n"
-	
+
 	set -x ; "${mycmdline[@]}"  | tee "${bstarlslist}" ; set +x
 #	less "${bstarfilelist}"
 
@@ -305,9 +307,9 @@ function lexit() { exit ; }
 	#	tmpstr=\''{ md5sum - ; echo \$TAR_REALNAME ; } | sed -e '\'':a;N;$!ba;s/-\\n//g'\'\'
 
 	mycmdline_tarrestore=( tar "${mytaroptions_all[@]}" 				--extract 		--file "${mytarname}")
-	
+
 	mycmdline=(	"${mycmdline_tarrestore[@]}" --to-command="${tmpstr}" )
-	
+
 	echo -e "\n${IAM}: Generating md5sum list file ...\n"
 
 	set -x ; "${mycmdline[@]}" | tee "${bstarmd5list}" ; set +x
@@ -327,7 +329,7 @@ function lexit() { exit ; }
 
 
 	# Files to be included at top of tar ...
-	
+
 	myfilelist_vars=( bstarlogname bstarlslist bstarmd5list )
 
 	myfilelist=( "${!myfilelist_vars[0]}" "${!myfilelist_vars[1]}" "${!myfilelist_vars[2]}" )
@@ -335,7 +337,7 @@ function lexit() { exit ; }
 	# The above is equivalent to:
 	# myfilelist=( "${bstarlogname}" "${bstarlslist}" "${bstarmd5list}" )
 	# - however, the indirection means only 1 place to maintain/change the filelist.
-	
+
 #	echo "${myfilelist_vars[0]}" is \'"${!myfilelist_vars[0]}"\'
 #	echo "${myfilelist_vars[1]}" is \'"${!myfilelist_vars[1]}"\'
 #	echo "${myfilelist_vars[2]}" is \'"${!myfilelist_vars[2]}"\'
@@ -348,7 +350,7 @@ function lexit() { exit ; }
 
 	[[ ${REPLY:0:1} == "y" ]] && less "${myfilelist[@]}"
 
-	
+
 #	Originally, compressed log files (and re-extracted .log file here [due to
 #	--remove-files]), to gain checksumming for those files. However, once
 #	discovered that tar won't append to compressed tarballs, (thus the tarball
@@ -359,7 +361,7 @@ function lexit() { exit ; }
 #	myfilelist=( "${bstarhowto}" "${myfilelist[@]}" )
 
 	myfilelist_vars=( bstarhowto "${myfilelist_vars[@]}" )
-	
+
 #	echo myfilelist_vars = "${myfilelist_vars[@]}"
 
 	myfilelist=( "${!myfilelist_vars[0]}" "${myfilelist[@]}" )
@@ -381,7 +383,7 @@ function lexit() { exit ; }
 
 
 	cat > "${bstarhowto}" <<-EOF
-	
+
 		Tar was seeded by: '${mycmdline_create[@]}'
 
 		(Then appended to by --catenate "${mytarname}" then with "${o_bstarmd5s}")
@@ -448,7 +450,7 @@ function lexit() { exit ; }
 	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
 
  	echo -e "\n${IAM}: Generating md5 list ...\n"
- 
+
 	set -x ; "${mycmdline[@]}" | tee "${bstarmd5s}" ; set +x
 
  	CurrErr=$? ; pauseiferror
@@ -462,7 +464,7 @@ function lexit() { exit ; }
 #	file, a way for the user to validate both ends of the tar - from which one
 #	can likely conclude that everything else in the middle of the tar has also
 #	maintained its integrity.
- 	
+
 	cat >> "${bstarmd5s}" <<-EOF
 
 		Note: If the original *.orig.md5s file (having '-' filenames, not original    filenames as the *.md5list file has) disappears, and this *.md5s file can still be successfully extracted from the still integral md5.tar file, diff will show  these last five text lines as added, and one last md5 line as different,        (ONLY!) - that's OK.
@@ -532,7 +534,7 @@ function lexit() { exit ; }
 #	echo o_myfilelist = "${o_myfilelist[@]}"
 
 
-	
+
 	echo -e "\n${IAM}: md5 list for future validation testing generated.\n\t... Renaming files with .orig. (And removing 'other' permissions.)\n\t[So restoring tarball won't (accidentally) overwrite them.]\n"
 
 	for(( itmp=0 ; itmp < "${#myfilelist[@]}" ; itmp++ )) ; do
@@ -601,12 +603,15 @@ function lexit() { exit ; }
 
 	read -rN1 -t 20 -p "${CRLF}${CRLF}${IAM}: Press 'd' to remove intermediate tar file - anything else not to ...${CRLF}${TAB}[Times out in 20 seconds to keep.]${CRLF}" || true
 
-	[[ ${REPLY:0:1} == "d" ]] && { echo -e "\n" ; rm -v "${mytarname}" ; }
+	[[ ${REPLY:0:1} == "d" ]] && { echo -e "\n" ; rm -v "${mytarname}" ; bwermedorigtar=1 ; }
 
 	echo
 
 
 	echo -e "\nCommands have been saved to \"${o_bstarhowto}\" for your future       reference.\n"
+
+
+	[[ $bwermedorigtar == 0 ]] && { echo -e "\nBase tar not removed. 'rm \"${mytarname}\"' when ready." ; }
 
 
 	tmpstr="${bstarname}"
@@ -620,7 +625,7 @@ lexit
 
 
 #	Assume dir being tarred is named '8bit'
-#	
+#
 #	STEPS:						Creates:
 #	------						--------
 #	 1. tar the tar				-> 8bit.md5.tar.log, 8bit.tar
@@ -633,7 +638,7 @@ lexit
 #	 X rm .filelist				 - no longer created in the first place.
 #	 6. Append orig. tar
 #	 7. Generate - md5 list		-> 8bit.md5.tar.md5s (- names)
-#	
+#
 #	 8. Note >> md5s list
 #	 9. make md5s list md5 (one) line
 #	10. Append md5 line to md5s list.
