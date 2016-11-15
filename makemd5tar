@@ -37,6 +37,11 @@
 #
 #	Don't forget to run shellcheck.
 
+#	TODO:
+#	- DONE: better logging
+#	- DONE: more cosmetic error response/handling, e.g. || true
+#	- SOME DAY: implement as main(); Options, e.g. logging, verbosity.
+
 # set -v -x
 
 # set | grep ^BASH | sort | less
@@ -47,12 +52,38 @@ set -o nounset	# == set -u
 set -o errexit	# == set -e
 set -o pipefail	# So | tee doesn't obscure retcodes.
 
-	trap 'echo -e \\n${IAM}: Non-zero "${?}" exit code trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \\n' ERR
 #	trap '[[ $? != 0 ]] && { echo -e \n${IAM}: Exit \($?\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \n ; set | sort | less' EXIT
-	trap '[[ $? != 0 ]] && { echo -e \\n${IAM}: Exit \("${?}"\) trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \\n ; }' EXIT
-
+#	trap '[[ $? != 0 ]] && { echo -e \\n${IAM}: Exit "${?}" trapped, line ${BASH_LINENO}/${LINENO}: ${BASH_COMMAND} \\n ; }' EXIT
 #	trap -l	# List trap (signal) names & numbers.
 #	trap -p	# List set traps with commands.
+
+
+	trap mytraperr ERR
+
+function mytraperr()	# ubyte mytrapexit(void)
+{
+	local CurrErr=$?
+
+	echo -e "\n${IAM}: Non-zero exit code trapped (${CurrErr}), line ${BASH_LINENO} (${FUNCNAME}:${LINENO}): \"\n${BASH_COMMAND}\n\"\n" | tee -a "${mylogfile}"
+} # /* ubyte mytrapexit(void) */
+
+
+	trap mytrapexit EXIT
+
+function mytrapexit()	# ubyte mytrapexit(void)
+{
+	local CurrErr=$?
+	
+	{ (( CurrErr != 0 )) && echo -e "\n${IAM}: Exit (${CurrErr}) trapped, line ${BASH_LINENO} (${FUNCNAME}:${LINENO}): \"${BASH_COMMAND}\" \n" | tee -a "${mylogfile}" ; } || true
+
+	myLogLine "Log file is '${mylogfile}'.\n"
+
+	exit ${CurrErr}
+} # /* ubyte mytrapexit(void) */
+
+
+#	Uncomment to override user's xz defaults.
+#	export XZ_OPT='-9e'
 
 #	Equivalence exit so we don't have to worry whether we're sourced or not.
 #	- this could be avoided by creating main(), then exit will always be
@@ -72,13 +103,15 @@ function lexit() { exit ; }
 
 # echo \$lexit = \'$lexit\'
 
+function pause() { read -rN1 -p "$'\n'Paused: Press enter to continue ...$'\n'" | tee -a "${mylogfile}" || true ; }
 
-#	Uncomment to override user's xz defaults.
-#	export XZ_OPT='-9e'
 
 	declare -gr	CRLF=$'\n'
 	declare -gr	TAB=$'\t'
 	declare -g	IAM	;	IAM=$(basename "${0}")	;	readonly IAM
+#	declare -g	MYTTY ;	MYTTY=$(tty)			;	readonly MYTTY	# nlu
+
+	printf -v RUNDATE "%(%D)T" -1 ; readonly RUNDATE
 
 	declare -gir largc=$#
 
@@ -89,6 +122,7 @@ function lexit() { exit ; }
 
 	declare -g tmpstr
 	declare -g tmpfile=""
+	declare -g currentrecoverycmdline=""
 
 	declare -ga mycmdline
 
@@ -154,10 +188,14 @@ function lexit() { exit ; }
 
 	declare -gr bstarbasename=${1:-""}
 
-	shift || true									# shift gives error if $# = 0, kicking in set -e. || true lets it pass set -e.
+	shift || true									# shift gives error if $# = 0, kicking in set -e. '|| true 'lets it pass set -e.
 	declare -ga myfileargs=${*:-"${bstarbasename}"}	; readonly myfileargs
 
 #	echo \'${bstarbasename}\' \'${myfileargs}\'
+
+
+	declare -gr	mylogfile="${bstarbasename}.${IAM}.log"
+
 
 	declare -gr mytarname="${bstarbasename}.tar"
 	declare -gr bstarname="${bstarbasename}.md5.tar"
@@ -194,11 +232,49 @@ function lexit() { exit ; }
 	declare -gr     n_bstarmd5s="${bstarname}.${xmd5s}.${xxnow}"
 
 
-	function pauseiferror()
+function pauseiferror()		# ubyte pauseiferror(void)
 {
-	{ (( CurrErr != 0 )) && GOTERR+=1 && read -rN1 -p "${CRLF}${IAM}: Non-zero (${CurrErr}) exit value encountered. Press Ctrl-C now to exit, or Enter to continue ..."  ; } || true
-}
+	local tmpstr
+	
+	if (( CurrErr != 0 )) ; then
+	{
+		GOTERR+=1
+		tmpstr="${CRLF}${IAM}: Non-zero (${CurrErr}) exit value encountered. Press Ctrl-C now to exit, or Enter to continue ..."
 
+		echo -en "${tmpstr}" >> "${mylogfile}"
+
+		read -rN1 -p "${tmpstr}"
+
+		tmpstr="${REPLY:0:1}"
+
+		echo -en "${tmpstr}" >> "${mylogfile}"
+
+		{ [[ "${currentrecoverycmdline}" != "" ]] && 	myLogLine "Recovery cmd line is '\n${currentrecoverycmdline}\n' ..." ; } || true
+	} fi
+} # /* ubyte pauseiferror(void) */
+
+
+function myLogLine()	# ubyte myLogLine( <log string> [, <echo args>] )
+{
+	local myechoargs=""
+
+#	echo -e "\nfunction myLogLine(\nArg 1:'${1:-""}'\nArg 2:'${2:-""}'\n\n"
+
+	if (( $# < 1 || $# > 2 )) ; then
+	{
+		echo -e "\n\n*##* ${RUNDATE} $(printf "%(%T)T" -1) - ${IAM}: myLogLine() # args (${#}) error. Called with '${@}'\n\nReturning.\n\n" | tee -a "${mylogfile}"
+		return 1
+	} fi
+
+	(( $# > 1 )) && myechoargs="${2}"
+
+	echo -e"${myechoargs}" "\n\n*##* ${RUNDATE} $(printf "%(%T)T" -1) - ${IAM}: ${1:-\"\"}" | tee -a "${mylogfile}"
+
+} # /* ubyte myLogLine( <log string> [, <echo args>] ) */
+
+
+#function ubyte main()
+#{
 
 	if [[ -z "${bstarbasename}" ]] ; then
 	{
@@ -220,13 +296,19 @@ function lexit() { exit ; }
 		lexit
 	} fi
 
+
 	if (( largc < 2 )) ; then
 	{
-		read -rN1 -p "${CRLF}${IAM}: Using '${myfileargs[@]}' as both the tar filename and the directory to include.${CRLF}${CRLF}${TAB}If this is not what you want, press Ctrl-C to exit now.${CRLF}${CRLF}${TAB}Otherwise, press Enter to continue ...${CRLF}${CRLF}${TAB}"
-
-		echo -e "Running: '${0}' '${bstarbasename}' '${myfileargs[@]}'\n"
+		read -rN1 -t 10 -p "${CRLF}${IAM}: Using '${myfileargs[@]}' as both the tar filename and the directory to include.${CRLF}${CRLF}${TAB}If this is not what you want, press Ctrl-C now to exit.${CRLF}${CRLF}${TAB}Otherwise, press Enter to continue ...${CRLF}${TAB}[Times out in 10 seconds to continue.]${CRLF}" | tee -a "${mylogfile}" || true
 	} fi
 
+
+	[[ -f "${mylogfile}" ]] && { echo -e "\n${IAM}: Removing prior log file ..." ; rm -fv "${mylogfile}" | tee -a "${mylogfile}"  ; }
+
+
+	myLogLine "Starting '${0} ${bstarbasename} ${myfileargs[@]}' ..."
+
+	myLogLine "Log file is '${mylogfile}' ..."
 
 #	Sadly:
 #	(1) tar output goes to --index-file OR stdout, NOT BOTH - (*&^(*&^(*^&(*^
@@ -250,28 +332,32 @@ function lexit() { exit ; }
 #	Thanks to shellcheck, $mycmdline construct works, now that vars are arrays, not strings.
 
 
-#	additional --verbose added here to get ls -l version of log.
+#	additional --verbose added here would get ls -l version of log.
 
-	mycmdline=( "${mycmdline_create[@]}"	)
+	mycmdline="${mycmdline_create[*]} 2>&1 | tee ${bstarlogname}"
+#	{ set -x ; "${mycmdline[@]}" 2>&1 | tee "${bstarlogname}" ; CurrErr=$? ;  set +x ; } || true ; pauseiferror
 
-	echo -e "\n${IAM}: Running tar ...\n"
+	myLogLine "Running tar '\n${mycmdline}\n' ...\n"
 
-	set -x ; "${mycmdline[@]}" 2>&1 | tee "${bstarlogname}"  ; set +x
-
-	CurrErr=$? ; pauseiferror
-
+	currentrecoverycmdline="tar ${mytaroptions_all[*]} --extract --file ${mytarname} ; rm ${bstarlogname} ${mytarname}"
 
 
-	mycmdline_striplog=( sed 's/^\.*//' "${bstarlogname}" )
+#	{ set -x ; eval "${mycmdline[@]}" ; CurrErr=$? ;  set +x ; } || true ; pauseiferror
 
-	mycmdline=( "${mycmdline_striplog[@]}" )
 
-	echo -e "\n${IAM}: Generating tar ls filelist from logfile ...\n"
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
-	set -x ; "${mycmdline[@]}"  | tee "${bstarlslist}" ; set +x
+
+	mycmdline_striplog=( sed "'s/^\.*//g'" "${bstarlogname}" )
+
+	mycmdline="${mycmdline_striplog[*]} | tee ${bstarlslist}"
+
+	myLogLine "Generating tar ls filelist from logfile '\n${mycmdline}\n' ...\n"
+
+
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
+
 #	less "${bstarfilelist}"
-
-	CurrErr=$? ; pauseiferror
 
 
 #	In the end, want:	  { md5sum - ; echo \$TAR_REALNAME ; } | sed -e ':a;N;$!ba;s/-\n//g'
@@ -282,8 +368,8 @@ function lexit() { exit ; }
 	# notshellcheck disable=SC2072 "SC2072: Decimals are not supported. Either use integers only, or use bc or awk to compare."
 
 #	if [[ ! "${BASH_VERSION}" < "4.3" ]] ; then
-	if [[ ! "${tarverstr}" < "tar (GNU tar) 1.27" ]] ; then
-	{
+#	if [[ ! "${tarverstr}" < "tar (GNU tar) 1.27" ]] ; then
+#	{
 		# (K)ubuntu 12.04, $BASH_VERSION 4.2.25(1)-release, this code wasn't
 		# needed, things worked just fine. Move to (K)ubuntu 14.04,
 		# $BASH_VERSION 4.3.11(1)-release and it falls over. tar reports
@@ -297,10 +383,13 @@ function lexit() { exit ; }
 
 		# NO!!! PROBLEM IS NOT BASH, PROBLEM IS ***TAR*** CHANGED!!!
 
+		# Later, with change to eval ${cmdline}, problem surfaces even on 12.04.
+		# 'TAR_REALNAME: unbound variable'.
+
 		tmpfile=$(mktemp --tmpdir "${IAM}"-XXX)
 		echo "${tmpstr}" > "${tmpfile}"
 		tmpstr="bash ${tmpfile}"
-	} fi
+#	} fi
 
 	# Work around quoting issues, keep shellcheck happy.
 	# *** "To escape the single quote, close the quoting before it, insert the single quote, and re-open the quoting." ***
@@ -308,13 +397,12 @@ function lexit() { exit ; }
 
 	mycmdline_tarrestore=( tar "${mytaroptions_all[@]}" 				--extract 		--file "${mytarname}")
 
-	mycmdline=(	"${mycmdline_tarrestore[@]}" --to-command="${tmpstr}" )
+	mycmdline="${mycmdline_tarrestore[*]} --to-command=\"${tmpstr}\" | tee ${bstarmd5list}"
 
-	echo -e "\n${IAM}: Generating md5sum list file ...\n"
+	myLogLine "Generating md5sum list file '\n${mycmdline}\n' ...\n"
 
-	set -x ; "${mycmdline[@]}" | tee "${bstarmd5list}" ; set +x
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
-	CurrErr=$? ; pauseiferror
 
 	if [[ ! -z $tmpfile ]] ; then
 	{
@@ -345,10 +433,24 @@ function lexit() { exit ; }
 #	echo myfilelist_vars is \'"${myfilelist_vars[@]}"\'
 #	echo myfilelist is \'"${myfilelist[@]}"\'
 
+	tmpstr="${CRLF}${IAM}: Press 'y' to review file lists and logs, anything else to continue ...${CRLF}${TAB}[Times out in 10 seconds to skip.]${CRLF}"
 
-	read -rN1 -t 10 -p "${CRLF}${IAM}: Press 'y' to review file lists and logs, anything else to continue ...${CRLF}${TAB}[Times out in 10 seconds to skip.]${CRLF}" || true
+	echo -en "${tmpstr}" >> "${mylogfile}"
 
-	[[ ${REPLY:0:1} == "y" ]] && less "${myfilelist[@]}"
+#	Want:
+#	read -rN1 -t 10 -p "${tmpstr}" | tee -a "${mylogfile}"
+#	but bash subshells pipelines, so $REPLY is lost!
+
+	read -rN1 -t 10 -p "${tmpstr}"
+#	read -rN1 -t 10 -p "${CRLF}${IAM}: Press 'y' to review file lists and logs, anything else to continue ...${CRLF}${TAB}[Times out in 10 seconds to skip.]${CRLF}" | tee -a "${mylogfile}"
+
+	tmpstr="${REPLY:0:1}"
+
+	echo -en "${tmpstr}" >> "${mylogfile}"
+	
+	[[ "${tmpstr}" != "${CRLF}" ]] && echo | tee -a "${mylogfile}"
+
+	[[ "${tmpstr}" == "y" ]] && script -qc "less ${myfilelist[*]}" /dev/null
 
 
 #	Originally, compressed log files (and re-extracted .log file here [due to
@@ -374,7 +476,7 @@ function lexit() { exit ; }
 	mycmdline_tarlist=(			tar "${mytaroptions_all[@]}"	--list		--verbose															)	# Changed from earlier.
 	mycmdline_tarrestore=(		tar "${mytaroptions_all[@]}"	--extract						--file "${bstarname}"							)	# Changed from earlier.
 	mycmdline_tarverify=(		tar "${mytaroptions_all[@]}"	--compare	--verbose			--file "${bstarname}"							)
-	mycmdline_dashmd5verify=(	"${mycmdline_tarrestore[@]}" 	"--to-command=md5sum -"	)
+	mycmdline_dashmd5verify=(	"${mycmdline_tarrestore[@]}" 	"--to-command='md5sum -'"	)
 
 	mycmdline_filemd5verify=(	md5sum -c "${o_bstarmd5list}"	)
 
@@ -400,10 +502,9 @@ function lexit() { exit ; }
 
 		... then running: '${mycmdline_diffmd5verify[@]}'
 
-		You should see: '
+		... You should see: '
 		${diffmd5verify_success[@]}
-		'
-
+		'.
 	EOF
 
 
@@ -428,32 +529,25 @@ function lexit() { exit ; }
 #	   present - and we wouldn't be here (running).]
 #
 
-	mycmdline=( "${mycmdline_create[@]}" )
+	mycmdline="${mycmdline_create[*]}"
+
+	myLogLine "Initializing final tar file '\n${mycmdline}\n' ...\n"
+
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 
-	echo -e "\n\n${IAM}: Initializing final tar file ...\n"
+	mycmdline="${mycmdline_catenate[*]}"
 
-	set -x ; "${mycmdline[@]}"  ; set +x
+	myLogLine "Appending initial '${mytarname}' to final tar file '\n${mycmdline}\n' ...\n"
 
-	CurrErr=$? ; pauseiferror
-
-
-	mycmdline=( "${mycmdline_catenate[@]}"	)
-
-	echo -e "\n${IAM}: Appending source tarball ...\n"
-
-	set -x ; "${mycmdline[@]}"  ; set +x
-
-	CurrErr=$? ; pauseiferror
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 
-	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
+	mycmdline="${mycmdline_dashmd5verify[*]} | tee ${bstarmd5s}"
 
- 	echo -e "\n${IAM}: Generating md5 list ...\n"
+	myLogLine "Generating md5 list '\n${mycmdline}\n' ...\n"
 
-	set -x ; "${mycmdline[@]}" | tee "${bstarmd5s}" ; set +x
-
- 	CurrErr=$? ; pauseiferror
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 
 #	- Append note to md5s (-) list to advise of expected diff results.
@@ -478,22 +572,18 @@ function lexit() { exit ; }
 	echo "${tmpstr}" >> "${bstarmd5s}"
 
 
-	mycmdline=( "${mycmdline_append[@]}"	)
+	mycmdline="${mycmdline_append[*]}"
 
- 	echo -e "\n${IAM}: Appending md5s list to tar ...\n"
+	myLogLine "Appending md5s list to tar '\n${mycmdline}\n' ...\n"
 
-	set -x ; "${mycmdline[@]}" ; set +x
-
- 	CurrErr=$? ; pauseiferror
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 
-	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
+	mycmdline="${mycmdline_dashmd5verify[*]} | tee ${bstarmd5s}"
 
- 	echo -e "\n${IAM}: Regenerating md5 list for future validation testing ...\n"
+	myLogLine "Regenerating md5 list for future validation testing '\n${mycmdline}\n' ...\n"
 
-	set -x ; "${mycmdline[@]}" | tee "${bstarmd5s}" ; set +x
-
- 	CurrErr=$? ; pauseiferror
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 
 #	myfilelist=( "${myfilelist[@]}" "${bstarmd5s}" )
@@ -535,12 +625,12 @@ function lexit() { exit ; }
 
 
 
-	echo -e "\n${IAM}: md5 list for future validation testing generated.\n\t... Renaming files with .orig. (And removing 'other' permissions.)\n\t[So restoring tarball won't (accidentally) overwrite them.]\n"
+	myLogLine "md5 list for future validation testing generated.\n\tRenaming files with .orig. (And removing 'other' permissions.)\n\t[So restoring the .tar won't (accidentally) overwrite them.]\n"
 
 	for(( itmp=0 ; itmp < "${#myfilelist[@]}" ; itmp++ )) ; do
 	{
-		mv -fvi "${myfilelist[$itmp]}" "${o_myfilelist[$itmp]}"	|| true	# -i shouldn't be needed, but in case something happens.
-		chmod -c a-x,o-rw "${o_myfilelist[$itmp]}"				|| true # Could use -v instead of -c.
+		mv -fvi "${myfilelist[$itmp]}" "${o_myfilelist[$itmp]}"	2>&1	| tee -a "${mylogfile}" || true	# -i shouldn't be needed, but in case something happens.
+		chmod -c a-x,o-rw "${o_myfilelist[$itmp]}"				2>&1	| tee -a "${mylogfile}"	|| true # Could use -v instead of -c.
 	}; done
 
 
@@ -551,77 +641,110 @@ function lexit() { exit ; }
 
 
 
-	echo -e "\n\n${IAM}: *** DO NOT LOSE THESE FILES ***:\n\n\t${o_myfilelist[@]}\n\n\t- if you do lose them, you can re-extract non-.orig named copies of them from the beginning of your tar. You will want to rename them once you do.\n"
+	myLogLine "*** DO NOT LOSE THESE FILES ***:\n\n\t${o_myfilelist[*]}\n\n\t- if you do lose them, you can re-extract non-.orig named copies of them from the beginning of your .tar.\n\t= You will want to rename them once you do."
 
-	echo -e "\n${IAM}: Contents of ${o_bstarhowto} -\n"
+	myLogLine "Contents of '${o_bstarhowto}':"
 
-	cat "${o_bstarhowto}"
-
-
-	mycmdline=( "${mycmdline_dashmd5verify[@]}"	)
-
-	echo -e "\n${IAM}: Running md5 validation test now ...\n"
-
-	set -x ; "${mycmdline[@]}" | tee "${n_bstarmd5s}" ; set +x
-
-	CurrErr=$? ; pauseiferror
-
-	echo
-	{ diff -s "${o_bstarmd5s}" "${n_bstarmd5s}" ; CurrErr=$? ; } || true
+#	cat "${o_bstarhowto}" | tee -a "${mylogfile}" == shellcheck 'SC2002: Useless cat. Consider 'cmd < file | ..' or 'cmd file | ..' instead.'
+	tee -a "${mylogfile}" < "${o_bstarhowto}"
 
 
-	read -rN1 -t 20 -p "${CRLF}${CRLF}${IAM}: Press 'n' to not compress tar file - anything else to do so ...${CRLF}${TAB}[Times out in 20 seconds to compress.]${CRLF}" || true
+	mycmdline="${mycmdline_dashmd5verify[*]} | tee ${n_bstarmd5s}"
 
-	if [[ ${REPLY:0:1} != "n" ]] ; then
+	myLogLine "Preparing for md5 validation test now '\n${mycmdline}\n' ...\n"
+
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
+
+
+	echo | tee -a "${mylogfile}"
+
+	mycmdline="diff -s '${o_bstarmd5s}' '${n_bstarmd5s}'"
+
+	myLogLine "Running md5 validation test now '\n${mycmdline}\n' ...\n"
+
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
+
+
+	tmpstr="${CRLF}${CRLF}${IAM}: Press 'n' to not compress tar file - anything else to do so ...${CRLF}${TAB}[Times out in 20 seconds to compress.]${CRLF}"
+
+	echo -en "${tmpstr}" >> "${mylogfile}"
+
+	read -rN1 -t 20 -p "${tmpstr}"
+
+	tmpstr="${REPLY:0:1}"
+
+	echo -en "${tmpstr}" >> "${mylogfile}"
+
+	[[ "${tmpstr}" != "${CRLF}" ]] && echo | tee -a "${mylogfile}"
+
+	if [[ "${tmpstr}" != "n" ]] ; then
 	{
-	 	echo -e "\n\n${IAM}: Compressing tarball to \"${bstarname_xz}\"...\n"
 
-	 	set -x ; xz -vz "${bstarname}" ; set +x
+		mycmdline="xz -vz ${bstarname}"
 
-	 	CurrErr=$? ; pauseiferror
+		myLogLine "Compressing tarball to \"${bstarname_xz}\" '\n${mycmdline}\n' ...\n"
+
+		CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 		bwecompressed=1
 
-		echo -e "\n\n${IAM}: Testing compressed files's integrity ...\n"
 
-		set -x ; xz -vt "${bstarname_xz}" ; set +x
+		mycmdline="xz -vt ${bstarname_xz}"
 
-		CurrErr=$? ; pauseiferror
+		myLogLine "Testing compressed files's integrity '\n${mycmdline}\n' ...\n"
+
+		CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
 
-		echo -e "\n\n${IAM}: Testing compressed tarballs's integrity ...\n"
+		mycmdline="${mycmdline_tarlist[*]} --file ${bstarname_xz}"
 
-		mycmdline=( "${mycmdline_tarlist[@]}" --file "${bstarname_xz}"	)
+		myLogLine "Testing compressed tarballs's integrity '\n${mycmdline}\n' ...\n"
 
-		set -x ; "${mycmdline[@]}" ; set +x
-
-		CurrErr=$? ; pauseiferror
+		CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 	} fi
 
 
 #	As --remove-files doesn't on catenate above ...
 
-	read -rN1 -t 20 -p "${CRLF}${CRLF}${IAM}: Press 'd' to remove intermediate tar file - anything else not to ...${CRLF}${TAB}[Times out in 20 seconds to keep.]${CRLF}" || true
+	tmpstr="${CRLF}${CRLF}${IAM}: Press 'd' to remove initial tar file '${mytarname}' - anything else not to ...${CRLF}${TAB}[Times out in 20 seconds to keep.]${CRLF}"
 
-	[[ ${REPLY:0:1} == "d" ]] && { echo -e "\n" ; rm -v "${mytarname}" ; bwermedorigtar=1 ; }
+	echo -en "${tmpstr}" >> "${mylogfile}"
 
-	echo
+	read -rN1 -t 20 -p "${tmpstr}"
 
+	tmpstr="${REPLY:0:1}"
 
-	echo -e "\nCommands have been saved to \"${o_bstarhowto}\" for your future       reference.\n"
+	echo -en "${tmpstr}" >> "${mylogfile}"
 
+	[[ "${tmpstr}" != "${CRLF}" ]] && echo | tee -a "${mylogfile}"
 
-	[[ $bwermedorigtar == 0 ]] && { echo -e "\nBase tar not removed. 'rm \"${mytarname}\"' when ready." ; }
+	if [[ "${tmpstr}" == "d" ]] ; then
+	{
+		mycmdline="rm -v ${mytarname}"
 
+		myLogLine "Removing intermediate tar file '\n${mycmdline}\n' ... should see \"removed '${mytarname}'\" ...\n"
+
+	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
+
+		bwermedorigtar=1
+	} fi
+
+	myLogLine "For your future reference, commands have been saved to\n\"${o_bstarhowto}\""
+
+	[[ $bwermedorigtar == 0 ]] && myLogLine "Base tar not removed. 'rm \"${mytarname}\"' when ready."
 
 	tmpstr="${bstarname}"
 	[[ $bwecompressed == 1 ]] && tmpstr="${bstarname_xz}"
 
-	[[ $CurrErr == 0 ]] && echo -e "\n${IAM}: \"${tmpstr}\" creation concluded, ${GOTERR} errors.\n"
+	(( CurrErr == 0 )) && myLogLine "\"${tmpstr}\" creation concluded, ${GOTERR} error(s)."
 
+#	Exit trap will do for us.
+#	myLogLine "Log file is: '${mylogfile}'.\n"
 
 set +v +x
 lexit
+
+#} /* function ubyte main() */
 
 
 #	Assume dir being tarred is named '8bit'
