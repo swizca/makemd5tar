@@ -186,7 +186,8 @@ function pause() { read -rN1 -p "$'\n'Paused: Press enter to continue ...$'\n'" 
 #	set +o nounset errexit	# BUGGER! Line caused $# to go to 1!
 #	- was trying to work around undefined var ERR trap with bstarbasename="$1"
 
-	declare -gr bstarbasename=${1:-""}
+	declare -g bstarbasename=${1:-""} ; bstarbasename=${bstarbasename%%"/"} # Strip off any trailing / to arg 1.
+	readonly bstarbasename
 
 	shift || true									# shift gives error if $# = 0, kicking in set -e. '|| true 'lets it pass set -e.
 	declare -ga myfileargs=${*:-"${bstarbasename}"}	; readonly myfileargs
@@ -238,7 +239,10 @@ function pauseiferror()		# ubyte pauseiferror(void)
 	
 	if (( CurrErr != 0 )) ; then
 	{
+		{ [[ "${currentrecoverycmdline}" != "" ]] && 	myLogLine "Recovery cmd line is '\n${currentrecoverycmdline}\n' ..." ; } || true
+
 		GOTERR+=1
+
 		tmpstr="${CRLF}${IAM}: Non-zero (${CurrErr}) exit value encountered. Press Ctrl-C now to exit, or Enter to continue ..."
 
 		echo -en "${tmpstr}" >> "${mylogfile}"
@@ -248,8 +252,6 @@ function pauseiferror()		# ubyte pauseiferror(void)
 		tmpstr="${REPLY:0:1}"
 
 		echo -en "${tmpstr}" >> "${mylogfile}"
-
-		{ [[ "${currentrecoverycmdline}" != "" ]] && 	myLogLine "Recovery cmd line is '\n${currentrecoverycmdline}\n' ..." ; } || true
 	} fi
 } # /* ubyte pauseiferror(void) */
 
@@ -341,12 +343,12 @@ function myLogLine()	# ubyte myLogLine( <log string> [, <echo args>] )
 
 	currentrecoverycmdline="tar ${mytaroptions_all[*]} --extract --file ${mytarname} ; rm ${bstarlogname} ${mytarname}"
 
-
 #	{ set -x ; eval "${mycmdline[@]}" ; CurrErr=$? ;  set +x ; } || true ; pauseiferror
-
 
 	CurrErr=0 ; eval "${mycmdline[@]} 2>&1" | tee -a "${mylogfile}" || CurrErr="${PIPESTATUS}" && pauseiferror
 
+	currentrecoverycmdline=""
+	
 
 	mycmdline_striplog=( sed "'s/^\.*//g'" "${bstarlogname}" )
 
